@@ -47,6 +47,27 @@ export interface AnnotationBox {
   label?: number;
 }
 
+/**
+ * A single click annotation: 1 = foreground (positive), 0 = background (negative).
+ */
+export interface PointAnnotation {
+  /** 1 = foreground (positive click), 0 = background (negative click) */
+  label: 0 | 1;
+  x: number;
+  y: number;
+  obj_id?: number;
+}
+
+/**
+ * Group of point annotations belonging to one object on one frame.
+ * SAM 2 can track multiple objects independently.
+ */
+export interface PointAnnotationGroup {
+  obj_id: number;
+  frame_idx: number;
+  points: PointAnnotation[];
+}
+
 const BASE_URL =
   (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:7263";
 const API_PREFIX = "/api";
@@ -121,6 +142,32 @@ export const api = {
       body: JSON.stringify({ boxes }),
     }),
 
+  /** Submit point annotations (multi-object, multi-frame) */
+  annotatePoints: (jobId: string, groups: PointAnnotationGroup[]) =>
+    http<{ ok: true; accepted: number }>(`/job/${jobId}/annotate/points`, {
+      method: "POST",
+      body: JSON.stringify({ groups }),
+    }),
+
+  /**
+   * Run SAM 2 image predictor on a single frame with the given clicks,
+   * returning a mask preview as a PNG URL. Used for the interactive
+   * "click-to-preview" loop in the UI.
+   *
+   * `threshold` (0..1) is forwarded as a confidence threshold for the
+   * binarized mask returned in `png_url`.
+   */
+  previewSegment: (
+    jobId: string,
+    frameIdx: number,
+    points: PointAnnotation[],
+    threshold = 0.5
+  ): Promise<{ mask_url: string; score: number; png_url: string }> =>
+    http(`/job/${jobId}/preview/segment`, {
+      method: "POST",
+      body: JSON.stringify({ frame_idx: frameIdx, points, threshold }),
+    }),
+
   /** Kick off processing (returns immediately, progress via WebSocket) */
   startProcessing: (jobId: string) =>
     http<{ ok: true }>(`/job/${jobId}/start`, { method: "POST" }),
@@ -139,4 +186,12 @@ export const api = {
     const stripped = BASE_URL.replace(/^https?:\/\//, "");
     return `${wsProto}://${stripped}${API_PREFIX}/ws/${jobId}`;
   },
+
+  /**
+   * Build the URL for a small thumbnail of an arbitrary frame.
+   * If the backend doesn't support this, callers should fall back to
+   * `previewUrl` (a larger image).
+   */
+  thumbnailUrl: (jobId: string, frameIdx: number, width = 160) =>
+    `${BASE_URL}${API_PREFIX}/job/${jobId}/thumbnail?frame=${frameIdx}&width=${width}`,
 };
