@@ -33,6 +33,7 @@ import type {
   PointAnnotationGroup,
 } from "@/lib/api";
 import { api } from "@/lib/api";
+import { VideoTimelineStrip } from "@/components/video-timeline-strip";
 import { cn } from "@/lib/utils";
 
 type Mode = "positive" | "negative";
@@ -727,6 +728,17 @@ export function VideoFrameClickAnnotator({
             <kbd className="mx-1 rounded border bg-muted px-1 font-mono text-[10px]">?</kbd>
             for shortcuts
           </p>
+        </div>
+
+        {/* Timeline strip */}
+        <div className="mt-4">
+          <VideoTimelineStrip
+            jobId={jobId}
+            numFrames={numFrames}
+            currentFrame={frameIdx}
+            onFrameSelect={(f) => onFrameChange?.(f)}
+            groups={groups}
+          />
         </div>
       </CardContent>
     </Card>

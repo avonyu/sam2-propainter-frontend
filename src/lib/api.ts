@@ -186,4 +186,12 @@ export const api = {
     const stripped = BASE_URL.replace(/^https?:\/\//, "");
     return `${wsProto}://${stripped}${API_PREFIX}/ws/${jobId}`;
   },
+
+  /**
+   * Build the URL for a small thumbnail of an arbitrary frame.
+   * If the backend doesn't support this, callers should fall back to
+   * `previewUrl` (a larger image).
+   */
+  thumbnailUrl: (jobId: string, frameIdx: number, width = 160) =>
+    `${BASE_URL}${API_PREFIX}/job/${jobId}/thumbnail?frame=${frameIdx}&width=${width}`,
 };
