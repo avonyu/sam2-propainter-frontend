@@ -1,21 +1,33 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  ChevronLeft,
+  ChevronRight,
   Crosshair,
-  Loader2,
-  Plus,
-  Trash2,
   Eye,
   EyeOff,
+  Keyboard,
+  Loader2,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import type {
   PointAnnotation,
   PointAnnotationGroup,
@@ -27,13 +39,17 @@ type Mode = "positive" | "negative";
 
 interface VideoFrameClickAnnotatorProps {
   jobId: string;
-  /** URL to the first-frame preview image (jpeg) */
-  imageUrl: string;
+  /** Total number of frames in the video, for the frame-stepper UI. */
+  numFrames: number;
+  /** URL of the *current* frame preview. Will be refetched when frame changes. */
+  imageUrlForFrame: (frameIdx: number) => string;
   /** Currently selected object id (1, 2, 3…). */
   objId: number;
   /** The frame index on which the user is annotating. */
   frameIdx: number;
-  /** All point groups across frames (this component owns the points on `frameIdx`). */
+  /** Called when the user steps to a different frame. */
+  onFrameChange?: (frameIdx: number) => void;
+  /** All point groups across frames. */
   groups: PointAnnotationGroup[];
   /** Called whenever groups change. */
   onChange?: (groups: PointAnnotationGroup[]) => void;
@@ -47,21 +63,28 @@ const OBJ_HUES = [
   "hsl(110 80% 55%)",
   "hsl(200 80% 60%)",
   "hsl(280 80% 65%)",
+  "hsl(320 80% 60%)",
 ];
 
 /**
- * Click-to-segment annotation tool.
+ * Click-to-segment annotation tool (v2).
  *
- * Click anywhere on the first frame to drop a positive (green) or negative
- * (red) point. SAM 2's image predictor runs on the backend and returns a
- * mask preview PNG that is overlaid on the image. Multi-object tracking is
- * supported: each object has its own color.
+ * Improvements over v1:
+ *  - Multi-frame annotation (jump between frames, points persist per-frame)
+ *  - Keyboard shortcuts: +/- toggle mode, Z undo, C clear, [ / ] step frames
+ *  - Coalesced in-flight preview requests (only the most recent one wins)
+ *  - Confidence threshold slider forwarded to the backend
+ *  - Drag-to-edit existing points
+ *  - Right-click on empty area to drop a negative point (positive by default)
+ *  - Per-frame and per-object legends
  */
 export function VideoFrameClickAnnotator({
   jobId,
-  imageUrl,
+  numFrames,
+  imageUrlForFrame,
   objId,
   frameIdx,
+  onFrameChange,
   groups,
   onChange,
   disabled = false,
@@ -76,14 +99,48 @@ export function VideoFrameClickAnnotator({
   const [previewVisible, setPreviewVisible] = useState(true);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [threshold, setThreshold] = useState(0.5);
 
-  // The points for the current frame & current obj_id
+  // Undo/redo stack
+  const undoStack = useRef<PointAnnotationGroup[][]>([]);
+  const redoStack = useRef<PointAnnotationGroup[][]>([]);
+
+  // In-flight request id for coalescing
+  const inflightRef = useRef<number | null>(null);
+  const debounceRef = useRef<number | null>(null);
+
+  // Drag-to-edit point state
+  const [drag, setDrag] = useState<
+    | { groupIdx: number; pointIdx: number }
+    | null
+  >(null);
+
   const currentGroup = groups.find(
     (g) => g.frame_idx === frameIdx && g.obj_id === objId
   );
   const currentPoints = currentGroup?.points ?? [];
+  const currentImageUrl = imageUrlForFrame(frameIdx);
 
-  // notify parent when groups change
+  // Snapshot for undo
+  const pushUndo = useCallback(
+    (current: PointAnnotationGroup[]) => {
+      undoStack.current.push(JSON.parse(JSON.stringify(current)));
+      if (undoStack.current.length > 50) undoStack.current.shift();
+      redoStack.current = [];
+    },
+    []
+  );
+
+  // Apply a new groups array (records undo snapshot first)
+  const applyGroups = useCallback(
+    (next: PointAnnotationGroup[]) => {
+      pushUndo(groups);
+      onChange?.(next);
+    },
+    [groups, onChange, pushUndo]
+  );
+
+  // notify parent on local mutations from outside (eg. clearAll in toolbar)
   useEffect(() => {
     onChange?.(groups);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,7 +155,16 @@ export function VideoFrameClickAnnotator({
     }
   }, []);
 
-  // Coordinate helpers: client-space → image-space
+  // Reset preview when frame changes
+  useEffect(() => {
+    setPreviewPng(null);
+    setPreviewError(null);
+    if (currentPoints.length > 0) {
+      requestPreviewRefresh(currentPoints);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frameIdx]);
+
   const toImageCoords = useCallback(
     (clientX: number, clientY: number) => {
       if (!containerRef.current || !imageSize) return null;
@@ -117,105 +183,241 @@ export function VideoFrameClickAnnotator({
     [imageSize]
   );
 
-  // Drop a point on the current frame for the current object
-  const onContainerPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (disabled) return;
-    if (e.button !== 0) return;
-    // ignore clicks on UI controls inside the container
-    if ((e.target as HTMLElement).closest("[data-overlay-control]")) return;
-    const coords = toImageCoords(e.clientX, e.clientY);
-    if (!coords) return;
-    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+  // ----- Adding / removing / clearing points -----
 
-    const newPoint: PointAnnotation = {
-      label: mode === "positive" ? 1 : 0,
-      x: coords.x,
-      y: coords.y,
-      obj_id: objId,
-    };
-
-    // Add to current group or create new
-    const next: PointAnnotationGroup[] = (() => {
-      const exists = groups.find(
+  const addPoint = (x: number, y: number, label: 0 | 1) => {
+    const newPoint: PointAnnotation = { label, x, y, obj_id: objId };
+    const next = (() => {
+      const idx = groups.findIndex(
         (g) => g.frame_idx === frameIdx && g.obj_id === objId
       );
-      if (!exists) {
+      if (idx < 0) {
         return [
           ...groups,
           { obj_id: objId, frame_idx: frameIdx, points: [newPoint] },
         ];
       }
-      return groups.map((g) =>
-        g.frame_idx === frameIdx && g.obj_id === objId
-          ? { ...g, points: [...g.points, newPoint] }
-          : g
+      return groups.map((g, i) =>
+        i === idx ? { ...g, points: [...g.points, newPoint] } : g
       );
     })();
-
-    // trigger via setState (we can't directly mutate `groups`)
-    setGroups(next);
-    requestPreviewRefresh();
+    applyGroups(next);
+    requestPreviewRefresh(next.find((g) => g.frame_idx === frameIdx && g.obj_id === objId)?.points ?? []);
   };
 
-  const setGroups = (next: PointAnnotationGroup[]) => {
-    // mutate via internal event-like pattern
-    onChange?.(next);
-  };
-
-  const removePoint = (idx: number) => {
+  const removePoint = (pointIdx: number) => {
     const next = groups
       .map((g) =>
         g.frame_idx === frameIdx && g.obj_id === objId
-          ? { ...g, points: g.points.filter((_, i) => i !== idx) }
+          ? { ...g, points: g.points.filter((_, i) => i !== pointIdx) }
           : g
       )
       .filter((g) => g.points.length > 0);
-    onChange?.(next);
-    requestPreviewRefresh();
+    applyGroups(next);
+    const pts = next.find((g) => g.frame_idx === frameIdx && g.obj_id === objId)?.points ?? [];
+    if (pts.length === 0) setPreviewPng(null);
+    else requestPreviewRefresh(pts);
   };
 
-  const clearCurrent = () => {
+  const clearCurrentObjectOnFrame = () => {
     const next = groups.filter(
       (g) => !(g.frame_idx === frameIdx && g.obj_id === objId)
     );
-    onChange?.(next);
+    applyGroups(next);
     setPreviewPng(null);
   };
 
   const clearAll = () => {
-    onChange?.([]);
+    applyGroups([]);
     setPreviewPng(null);
   };
 
-  // Request a preview mask from the backend whenever points change
-  const refreshTimerRef = useRef<number | null>(null);
-  const requestPreviewRefresh = () => {
-    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
-    refreshTimerRef.current = window.setTimeout(async () => {
-      await runPreview();
-    }, 250); // debounce
+  // ----- Undo / redo -----
+
+  const undo = () => {
+    const prev = undoStack.current.pop();
+    if (!prev) return;
+    redoStack.current.push(JSON.parse(JSON.stringify(groups)));
+    onChange?.(prev);
   };
 
-  const runPreview = async () => {
-    if (currentPoints.length === 0) {
+  const redo = () => {
+    const nxt = redoStack.current.pop();
+    if (!nxt) return;
+    undoStack.current.push(JSON.parse(JSON.stringify(groups)));
+    onChange?.(nxt);
+  };
+
+  // ----- Preview fetching (debounced + coalesced) -----
+
+  const requestPreviewRefresh = (pts: PointAnnotation[]) => {
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(() => {
+      void runPreview(pts);
+    }, 220);
+  };
+
+  const runPreview = async (pts: PointAnnotation[]) => {
+    if (pts.length === 0) {
       setPreviewPng(null);
       return;
     }
+    const reqId = (inflightRef.current ?? 0) + 1;
+    inflightRef.current = reqId;
     setLoadingPreview(true);
     setPreviewError(null);
     try {
-      const res = await api.previewSegment(jobId, frameIdx, currentPoints);
-      setPreviewPng(res.png_url);
+      const res = await api.previewSegment(
+        jobId,
+        frameIdx,
+        pts,
+        threshold
+      );
+      if (inflightRef.current === reqId) {
+        setPreviewPng(res.png_url);
+      }
     } catch (e: any) {
-      setPreviewError(e.message ?? "preview failed");
+      if (inflightRef.current === reqId) {
+        setPreviewError(e.message ?? "preview failed");
+      }
     } finally {
-      setLoadingPreview(false);
+      if (inflightRef.current === reqId) {
+        setLoadingPreview(false);
+      }
     }
   };
 
-  const totalPoints = groups.reduce((s, g) => s + g.points.length, 0);
-  const usedObjIds = Array.from(new Set(groups.map((g) => g.obj_id))).sort();
+  // Re-run preview when threshold changes (debounced)
+  useEffect(() => {
+    if (currentPoints.length === 0) return;
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(() => {
+      void runPreview(currentPoints);
+    }, 150);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threshold]);
+
+  // ----- Pointer interactions on the canvas -----
+
+  const onContainerPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    if ((e.target as HTMLElement).closest("[data-overlay-control]")) return;
+    if (e.button !== 0) return;
+    const coords = toImageCoords(e.clientX, e.clientY);
+    if (!coords) return;
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    addPoint(coords.x, coords.y, mode === "positive" ? 1 : 0);
+  };
+
+  const onPointPointerDown = (
+    e: ReactPointerEvent<HTMLDivElement>,
+    groupIdx: number,
+    pointIdx: number
+  ) => {
+    e.stopPropagation();
+    if (e.button !== 0) return;
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    setDrag({ groupIdx, pointIdx });
+  };
+
+  const onPointDragMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag) return;
+    const coords = toImageCoords(e.clientX, e.clientY);
+    if (!coords) return;
+    const next = groups.map((g, gi) =>
+      gi !== drag.groupIdx
+        ? g
+        : {
+            ...g,
+            points: g.points.map((p, pi) =>
+              pi !== drag.pointIdx ? p : { ...p, x: coords.x, y: coords.y }
+            ),
+          }
+    );
+    // Direct mutation (don't push undo during drag)
+    onChange?.(next);
+  };
+
+  const onPointDragEnd = () => {
+    if (!drag) return;
+    setDrag(null);
+    // After drag, refetch preview
+    const pts =
+      groups
+        .map((g, gi) => (gi === drag.groupIdx ? g.points : g.points))
+        .flat()
+        .filter(Boolean);
+    requestPreviewRefresh(pts);
+  };
+
+  // ----- Keyboard shortcuts -----
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    // ignore when focus is in a text input
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+    if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      setMode("positive");
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      setMode("negative");
+    } else if (e.key === "z" || e.key === "Z") {
+      e.preventDefault();
+      if (e.shiftKey) redo();
+      else undo();
+    } else if (e.key === "c" || e.key === "C") {
+      e.preventDefault();
+      clearCurrentObjectOnFrame();
+    } else if (e.key === "ArrowLeft" || e.key === "[") {
+      e.preventDefault();
+      onFrameChange?.(Math.max(0, frameIdx - 1));
+    } else if (e.key === "ArrowRight" || e.key === "]") {
+      e.preventDefault();
+      onFrameChange?.(Math.min(numFrames - 1, frameIdx + 1));
+    }
+  };
+
+  // ----- Derived -----
+
+  const totalPoints = useMemo(
+    () => groups.reduce((s, g) => s + g.points.length, 0),
+    [groups]
+  );
+  const usedObjIds = useMemo(
+    () => Array.from(new Set(groups.map((g) => g.obj_id))).sort(),
+    [groups]
+  );
+  const pointsByFrame = useMemo(() => {
+    const map: Record<number, number> = {};
+    groups.forEach((g) => {
+      map[g.frame_idx] = (map[g.frame_idx] ?? 0) + g.points.length;
+    });
+    return map;
+  }, [groups]);
+
   const objColor = OBJ_HUES[(objId - 1) % OBJ_HUES.length];
+
+  // Build lookup for point rendering
+  const flatPointList: {
+    point: PointAnnotation;
+    groupIdx: number;
+    pointIdx: number;
+    isCurrentObj: boolean;
+  }[] = [];
+  groups.forEach((g, gi) => {
+    if (g.frame_idx !== frameIdx) return;
+    g.points.forEach((p, pi) => {
+      flatPointList.push({
+        point: p,
+        groupIdx: gi,
+        pointIdx: pi,
+        isCurrentObj: g.obj_id === objId,
+      });
+    });
+  });
 
   return (
     <Card>
@@ -234,6 +436,24 @@ export function VideoFrameClickAnnotator({
           <Badge variant={totalPoints > 0 ? "success" : "secondary"}>
             {totalPoints} point{totalPoints !== 1 ? "s" : ""}
           </Badge>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm">
+                <Keyboard className="mr-1 h-3 w-3" /> Shortcuts
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-72 text-xs">
+              <div className="space-y-1 font-mono">
+                <Row k="+ / =" v="switch to positive mode" />
+                <Row k="− / _" v="switch to negative mode" />
+                <Row k="Z" v="undo" />
+                <Row k="Shift+Z" v="redo" />
+                <Row k="C" v="clear current object" />
+                <Row k="← / [" v="previous frame" />
+                <Row k="→ / ]" v="next frame" />
+              </div>
+            </PopoverContent>
+          </Popover>
           <Button
             variant="outline"
             size="sm"
@@ -245,8 +465,44 @@ export function VideoFrameClickAnnotator({
         </div>
       </CardHeader>
 
-      <CardContent>
-        {/* Toolbar */}
+      <CardContent tabIndex={0} onKeyDown={onKeyDown}>
+        {/* Frame stepper */}
+        <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/30 p-2">
+          <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => onFrameChange?.(Math.max(0, frameIdx - 1))}
+              disabled={disabled || frameIdx === 0}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => onFrameChange?.(Math.min(numFrames - 1, frameIdx + 1))}
+              disabled={disabled || frameIdx >= numFrames - 1}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+            <span className="ml-2 text-sm tabular-nums">
+              Frame{" "}
+              <span className="font-mono text-primary">
+                {String(frameIdx).padStart(4, "0")}
+              </span>
+              {" "}/ {numFrames}
+            </span>
+            {pointsByFrame[frameIdx] !== undefined && (
+              <Badge variant="secondary" className="ml-2">
+                {pointsByFrame[frameIdx]} pts here
+              </Badge>
+            )}
+          </div>
+        </div>
+
+        {/* Mode switcher + confidence slider */}
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <div
             role="tablist"
@@ -280,9 +536,9 @@ export function VideoFrameClickAnnotator({
           </div>
 
           <div className="flex items-center gap-1 text-xs text-muted-foreground">
-            Object:
+            <span>Object</span>
             <span
-              className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold text-black"
+              className="inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold text-black"
               style={{ background: objColor }}
             >
               {objId}
@@ -304,6 +560,34 @@ export function VideoFrameClickAnnotator({
             {previewVisible ? "Hide mask" : "Show mask"}
           </Button>
 
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={undo}
+            disabled={undoStack.current.length === 0}
+            data-overlay-control
+          >
+            <RotateCcw className="mr-1 h-3 w-3" /> Undo
+          </Button>
+
+          {/* Confidence threshold */}
+          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+            <Sparkles className="h-3 w-3" />
+            <span>Confidence</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={threshold}
+              onChange={(e) => setThreshold(parseFloat(e.target.value))}
+              className="h-1.5 w-24 accent-primary"
+              disabled={disabled}
+              data-overlay-control
+            />
+            <span className="w-8 tabular-nums">{threshold.toFixed(2)}</span>
+          </div>
+
           {loadingPreview && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -323,44 +607,64 @@ export function VideoFrameClickAnnotator({
             aspectRatio: imageSize ? `${imageSize.w} / ${imageSize.h}` : "16 / 9",
           }}
           onPointerDown={onContainerPointerDown}
+          onPointerMove={onPointDragMove}
+          onPointerUp={onPointDragEnd}
         >
           <img
+            key={currentImageUrl /* force reload when frame changes */}
             ref={imageRef}
-            src={imageUrl}
-            alt="Video frame"
+            src={currentImageUrl}
+            alt={`Frame ${frameIdx}`}
             onLoad={onImageLoad}
             className="absolute inset-0 h-full w-full object-contain"
             draggable={false}
             crossOrigin="anonymous"
           />
 
-          {/* Live mask overlay (semi-transparent PNG) */}
+          {/* Loading overlay (translucent spinner on top of image while previewing) */}
+          {loadingPreview && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
+              <Loader2 className="h-8 w-8 animate-spin text-white" />
+            </div>
+          )}
+
+          {/* Live mask overlay */}
           {previewPng && previewVisible && (
             <img
               src={previewPng}
               alt="SAM 2 mask preview"
               className="pointer-events-none absolute inset-0 h-full w-full object-contain"
-              style={{ opacity: 0.55, mixBlendMode: "normal" }}
+              style={{ opacity: 0.55 }}
             />
           )}
 
           {/* Point overlays */}
           {imageSize &&
             containerRef.current &&
-            currentPoints.map((p, i) => {
-              const color = p.label === 1 ? "hsl(140 80% 55%)" : "hsl(0 85% 60%)";
-              const leftPct = (p.x / imageSize.w) * 100;
-              const topPct = (p.y / imageSize.h) * 100;
+            flatPointList.map(({ point, groupIdx, pointIdx, isCurrentObj }) => {
+              const baseColor =
+                point.label === 1 ? "hsl(140 80% 55%)" : "hsl(0 85% 60%)";
+              const color = isCurrentObj
+                ? baseColor
+                : point.label === 1
+                  ? "hsl(140 30% 70%)"
+                  : "hsl(0 40% 70%)";
+              const leftPct = (point.x / imageSize.w) * 100;
+              const topPct = (point.y / imageSize.h) * 100;
               return (
-                <button
-                  key={i}
-                  title={`${p.label === 1 ? "+" : "−"} click #${i + 1}`}
+                <div
+                  key={`${groupIdx}-${pointIdx}`}
+                  title={`obj ${point.obj_id ?? objId} · ${point.label === 1 ? "+" : "−"}`}
                   data-overlay-control
-                  onClick={(e) => {
+                  onPointerDown={(e) => onPointPointerDown(e, groupIdx, pointIdx)}
+                  onDoubleClick={(e) => {
                     e.stopPropagation();
-                    removePoint(i);
+                    removePoint(pointIdx);
                   }}
-                  className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 transition hover:scale-110"
+                  className={cn(
+                    "absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2",
+                    !disabled && "cursor-move"
+                  )}
                   style={{
                     left: `${leftPct}%`,
                     top: `${topPct}%`,
@@ -374,7 +678,7 @@ export function VideoFrameClickAnnotator({
             })}
         </div>
 
-        {/* Object legend (if multiple objects were used) */}
+        {/* Object legend */}
         {usedObjIds.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-3 text-xs">
             {usedObjIds.map((id) => {
@@ -412,19 +716,28 @@ export function VideoFrameClickAnnotator({
           <Button
             variant="ghost"
             size="sm"
-            onClick={clearCurrent}
+            onClick={clearCurrentObjectOnFrame}
             disabled={disabled || currentPoints.length === 0}
             data-overlay-control
           >
-            Clear object {objId}
+            Clear object {objId} on this frame
           </Button>
           <p className="text-xs text-muted-foreground">
-            Tip: For best results, click the most central / representative part
-            of the object. Add a negative point on a similar-looking
-            neighbouring region to disambiguate.
+            Drag points to fine-tune · Double-click to delete · Press
+            <kbd className="mx-1 rounded border bg-muted px-1 font-mono text-[10px]">?</kbd>
+            for shortcuts
           </p>
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function Row({ k, v }: { k: string; v: string }) {
+  return (
+    <div className="flex justify-between gap-2">
+      <kbd className="rounded border bg-muted px-1 text-[10px]">{k}</kbd>
+      <span className="text-muted-foreground">{v}</span>
+    </div>
   );
 }

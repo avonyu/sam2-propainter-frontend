@@ -31,7 +31,7 @@ export function AnnotatePage() {
   const { jobId } = useParams<{ jobId: string }>();
   const nav = useNavigate();
   const [job, setJob] = useState<JobInfo | null>(null);
-  const [mode, setMode] = useState<PromptMode>("box");
+  const [mode, setMode] = useState<PromptMode>("click");
 
   // Box state
   const [boxes, setBoxes] = useState<AnnotationBox[]>([]);
@@ -39,6 +39,7 @@ export function AnnotatePage() {
   // Click state
   const [groups, setGroups] = useState<PointAnnotationGroup[]>([]);
   const [activeObjId, setActiveObjId] = useState(1);
+  const [activeFrame, setActiveFrame] = useState(0);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -83,6 +84,8 @@ export function AnnotatePage() {
     );
   }
 
+  const numFrames = job.video_meta?.num_frames ?? 1;
+
   return (
     <div className="mx-auto max-w-5xl space-y-6">
       <div className="flex items-center justify-between">
@@ -97,12 +100,12 @@ export function AnnotatePage() {
           size="sm"
           onClick={() => window.location.reload()}
         >
-          <RefreshCcw className="mr-2 h-3 w-3" /> Refresh preview
+          <RefreshCcw className="mr-2 h-3 w-3" /> Refresh
         </Button>
       </div>
 
       {/* Video meta */}
-      <div className="grid grid-cols-3 gap-3 text-center">
+      <div className="grid grid-cols-4 gap-3 text-center">
         <Stat label="Filename" value={job.video_meta?.filename ?? "—"} />
         <Stat
           label="Resolution"
@@ -120,6 +123,7 @@ export function AnnotatePage() {
               : "—"
           }
         />
+        <Stat label="Frames" value={String(numFrames)} />
       </div>
 
       {/* Mode switcher */}
@@ -129,13 +133,6 @@ export function AnnotatePage() {
         className="w-full"
       >
         <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="box">
-            <Square className="mr-2 h-4 w-4" />
-            Box prompt
-            <Badge variant="secondary" className="ml-2">
-              {boxes.length}
-            </Badge>
-          </TabsTrigger>
           <TabsTrigger value="click">
             <Crosshair className="mr-2 h-4 w-4" />
             Click prompt
@@ -143,19 +140,14 @@ export function AnnotatePage() {
               {totalClickPoints}
             </Badge>
           </TabsTrigger>
+          <TabsTrigger value="box">
+            <Square className="mr-2 h-4 w-4" />
+            Box prompt
+            <Badge variant="secondary" className="ml-2">
+              {boxes.length}
+            </Badge>
+          </TabsTrigger>
         </TabsList>
-
-        <TabsContent value="box" className="mt-4">
-          <VideoFrameAnnotator
-            imageUrl={api.previewUrl(jobId!)}
-            onChange={setBoxes}
-            disabled={submitting}
-          />
-          <p className="mt-2 text-xs text-muted-foreground">
-            Best for: logos, static text watermarks, fixed-size stamps.
-            Single box usually suffices.
-          </p>
-        </TabsContent>
 
         <TabsContent value="click" className="mt-4 space-y-4">
           {/* Object switcher for multi-object tracking */}
@@ -183,13 +175,27 @@ export function AnnotatePage() {
 
           <VideoFrameClickAnnotator
             jobId={jobId!}
-            imageUrl={api.previewUrl(jobId!)}
+            numFrames={numFrames}
+            imageUrlForFrame={(f) => `${api.previewUrl(jobId!)}?frame=${f}`}
             objId={activeObjId}
-            frameIdx={0}
+            frameIdx={activeFrame}
+            onFrameChange={setActiveFrame}
             groups={groups}
             onChange={setGroups}
             disabled={submitting}
           />
+        </TabsContent>
+
+        <TabsContent value="box" className="mt-4">
+          <VideoFrameAnnotator
+            imageUrl={api.previewUrl(jobId!)}
+            onChange={setBoxes}
+            disabled={submitting}
+          />
+          <p className="mt-2 text-xs text-muted-foreground">
+            Best for: logos, static text watermarks, fixed-size stamps.
+            Single box usually suffices.
+          </p>
         </TabsContent>
       </Tabs>
 

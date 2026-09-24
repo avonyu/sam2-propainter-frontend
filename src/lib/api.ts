@@ -153,15 +153,19 @@ export const api = {
    * Run SAM 2 image predictor on a single frame with the given clicks,
    * returning a mask preview as a PNG URL. Used for the interactive
    * "click-to-preview" loop in the UI.
+   *
+   * `threshold` (0..1) is forwarded as a confidence threshold for the
+   * binarized mask returned in `png_url`.
    */
   previewSegment: (
     jobId: string,
     frameIdx: number,
-    points: PointAnnotation[]
+    points: PointAnnotation[],
+    threshold = 0.5
   ): Promise<{ mask_url: string; score: number; png_url: string }> =>
     http(`/job/${jobId}/preview/segment`, {
       method: "POST",
-      body: JSON.stringify({ frame_idx: frameIdx, points }),
+      body: JSON.stringify({ frame_idx: frameIdx, points, threshold }),
     }),
 
   /** Kick off processing (returns immediately, progress via WebSocket) */
